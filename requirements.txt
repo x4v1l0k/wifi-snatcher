@@ -1,0 +1,2 @@
+# WiFi handshake capture script - optional for colored console output
+colorama>=0.4.6
