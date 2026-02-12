@@ -1,2 +1,2 @@
-# WiFi handshake capture script - optional for colored console output
+# wifi-snatcher: optional for colored console output (falls back to plain text if missing)
 colorama>=0.4.6

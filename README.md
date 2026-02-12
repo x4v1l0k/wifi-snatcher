@@ -3,11 +3,12 @@
 **wifi-snatcher.py** (Wifi-Snatcher) is a Python tool that:
 
 - Puts a Wi‑Fi interface into **monitor mode**.
-- Scans both **2.4 GHz and 5 GHz** networks with **clients** using `airodump-ng --band abg`.
-- Automatically **captures WPA/WPA2 handshakes** by deauthing clients.
-- Validates handshakes with **aircrack-ng** and **hcxpcapngtool** (hashcat‑ready).
+- Scans both **2.4 GHz and 5 GHz** for APs **with clients** or **hidden** (no client) using `airodump-ng --band abg`.
+- **Captures WPA/WPA2 handshakes** by broadcast deauth (all clients on the AP); validates with **aircrack-ng** and **hcxpcapngtool** (hashcat‑ready).
+- For **hidden networks without clients**, captures **PMKID** (every 5 cycles, grouped by channel) when **hcxdumptool** is available.
+- **Startup cleanup** of leftover files from previous runs; **exit**: re‑verifies handshakes and restores the interface.
 - Persists valid handshakes and **never attacks the same BSSID again**.
-- Optionally generates **per‑ESSID wordlists** with rich permutations and l33t variants.
+- Optionally generates **per‑ESSID wordlists** with case/leet variants and ISP masks.
 
 ---
 
@@ -25,17 +26,12 @@ sudo python3 wifi-snatcher.py -d wlan0
 ## Requirements
 
 - **Root** privileges (run with `sudo`).
-- **Aircrack-ng suite**:
-  - `airmon-ng` (monitor mode)
-  - `airodump-ng` (capture)
-  - `aireplay-ng` (deauth)
-  - `aircrack-ng` (handshake presence check)
-- **Recommended**: `hcxpcapngtool` (from `hcxtools`) to create `.22000` hashes for hashcat.
-- **Optional**: `colorama` for colored logging:
-
-```bash
-pip install colorama
-```
+- **Aircrack-ng suite**: `airmon-ng`, `airodump-ng`, `aireplay-ng`, `aircrack-ng`.
+- **iw** (channel / monitor mode).
+- **Recommended**: **hcxtools** (`hcxpcapngtool` for `.22000` hashes, `hcxdumptool` for PMKID on hidden networks):  
+  `sudo apt install hcxtools`
+- **Optional**: `colorama` for colored console output:  
+  `pip3 install -r requirements.txt`
 
 ---
 
@@ -47,9 +43,10 @@ sudo python3 wifi-snatcher.py -d wlan0
 
 This will:
 
+- Clean leftover files from previous runs in `handshakes/`.
 - Put `wlan0` into monitor mode (e.g. `wlan0mon`).
-- Continuously scan 2.4 GHz + 5 GHz (`--band abg`) for APs **with clients**.
-- Iterate over those networks, capture handshakes, and repeat until Ctrl+C.
+- Continuously scan 2.4 GHz + 5 GHz for APs **with clients** or **hidden** (no clients).
+- Capture handshakes (broadcast deauth), then at end of each cycle run **PMKID** for hidden-without-clients (every 5 cycles). Repeat until Ctrl+C.
 
 ---
 
@@ -58,7 +55,7 @@ This will:
 | Option | Description |
 |--------|-------------|
 | `-d`, `--device` | Wireless interface (e.g. `wlan0`). **Required** in capture mode; **optional** when using `-w/--wordlist`. |
-| `-t`, `--time` | Scan duration per cycle in seconds (default: `30`). |
+| `-t`, `--time` | Scan duration per cycle in seconds (default: `60`). |
 | `-l`, `--log` | Path to a log file. If set, all logs are also written there (without ANSI colors). |
 | `-p`, `--path` | Base directory for SQLite DB, handshakes, and temp files. Default: **current directory**. |
 | `-se`, `--skip-essid ESSID` | ESSID to skip (repeatable). Those networks are never attacked in this run. |
@@ -72,6 +69,9 @@ This will:
 | `--ap-timeout SECONDS` | Maximum capture time per AP (limits how long `airodump-ng` + deauth runs). |
 | `--ap-delay SECONDS` | Delay between APs to avoid driver issues (default: `2`). |
 | `--hidden-wait SECONDS` | Max time (seconds) to try revealing a hidden ESSID before capture (default: `25`). |
+| `--hidden-passive SECONDS` | Passive sniff time before deauth when revealing hidden ESSID (default: `10`). |
+| `--pmkid-timeout SECONDS` | Time per channel for PMKID capture; multiple BSSIDs on same channel are captured together (default: `15`). |
+| `--mac-rotate N` | Rotate interface MAC every N cycles to reduce router blocking (default: `0` = disabled). |
 
 Notes:
 
@@ -86,14 +86,14 @@ Notes:
    - If the interface is not already in monitor mode, `airmon-ng start <device>` is used.
    - On exit (including Ctrl+C), the script calls `airmon-ng stop <mon_iface>` to restore managed mode.
 
-2. **Scanning** (`get_networks_with_clients`)
-   - Runs `airodump-ng` with:
-     - Default: `airodump-ng --output-format csv --write <tmp_prefix> --band abg -a <mon_iface>`
-     - With fixed channel (`-c/--channel`): `airodump-ng --output-format csv --write <tmp_prefix> --channel N -a <mon_iface>`
-   - `--band abg` means: **2.4 GHz (b/g) + 5 GHz (a)**.
-   - Output CSV is parsed to find APs with at least one **associated client**.
+2. **Startup cleanup**
+   - Removes leftover files in `handshakes/` from previous runs: `pmkid_filter_*.txt`, `pmkid_*.pcapng`, `hs_*` (temporary capture files).
 
-3. **Target selection**
+3. **Scanning** (`get_networks_with_clients`)
+   - Runs `airodump-ng` with `--output-format csv --write <tmp_prefix> --band abg -a <mon_iface>` (or `--channel N` if `-c` is set).
+   - **Included**: APs with at least one **associated client** (for handshake), or **hidden** APs with no clients (for PMKID at end of cycle). Visible-ESSID APs with no clients are **not** attacked in that cycle.
+
+4. **Target selection**
    - APs are **ignored** if:
      - BSSID is already in the SQLite `captured` table.
      - BSSID is in `--skip-bssid`.
@@ -102,7 +102,7 @@ Notes:
      - If `-b/--bssid` is used, only APs whose BSSID is in the given list are processed.
      - If `-e/--essid` is used, only APs whose ESSID matches are processed (all APs with that ESSID are attacked).
 
-4. **Hidden ESSID recovery** (before handshake)
+5. **Hidden ESSID recovery** (before handshake)
    - If the AP’s ESSID is hidden (beacon does not broadcast it), the script treats it as `hidden_network`.
    - Before capturing the handshake, it tries to **reveal the real ESSID**:
      - Runs `airodump-ng` focused on that BSSID for a few seconds.
@@ -110,24 +110,24 @@ Notes:
      - Re-parses the airodump CSV and, if the ESSID appears for that BSSID, uses it for the rest of the run (filenames, DB, logs).
    - Revealed ESSIDs are cached in the `discovered_essids` table (BSSID → ESSID), so hidden APs are not re-probed in later runs.
    - `--hidden-wait` limits how long (seconds) the script spends on this recovery before proceeding to handshake capture with `hidden_network` if unrevealed.
-   - Statistics count **hidden_detected** and **hidden_resolved**.
+   - Statistics count **unique hidden** BSSIDs and **hidden_resolved**.
 
-5. **Handshake capture** (`capture_handshake`)
+6. **Handshake capture** (`capture_handshake`)
    - For each eligible AP (with clients):
-     - Runs a focused `airodump-ng` on `--channel <ch> --bssid <BSSID>` and writes `hs_<BSSID>_<ESSID>-01.cap` in `handshakes/`.
-     - Sends up to **5 rounds** of deauths with `aireplay-ng -0 2 -a <BSSID> -c <STA>`.
+     - Runs `airodump-ng` on `--channel <ch> --bssid <BSSID>` and writes `hs_<BSSID>_<ESSID>-01.cap` in `handshakes/`.
+     - Sends up to **5 rounds** of **broadcast deauth** with `aireplay-ng -0 4 -a <BSSID>` (no `-c`), so all clients on the AP are deauth’ed and any reconnect can yield the handshake.
      - Keeps the capture running while sending deauths and briefly after.
    - If **no handshake** is detected (`aircrack-ng <cap> -w /dev/null`):
      - The `.cap` and its side files are removed.
      - A per‑run **failure counter** for that BSSID is incremented.
 
-6. **Crackable handshake verification**
+7. **Crackable handshake verification**
    - A capture is only considered **valid & done** if **both**:
      1. `aircrack-ng` confirms at least one handshake.
      2. `hcxpcapngtool` successfully converts the `.cap` to `.22000` (non‑empty file).
    - If hcxpcapngtool **fails**, the capture is treated as a **false positive** and removed; the network will be attacked again later.
 
-7. **Storing successful captures**
+8. **Storing successful captures**
    - When hcxpcapngtool succeeds:
      - The `.cap` is renamed to `handshakes/<ESSID>_<hash>_<BSSID>.cap` (a short hash avoids collisions when ESSIDs share the first 32 chars).
      - The `.22000` is renamed to `handshakes/<ESSID>_<hash>_<BSSID>.cap.22000`.
@@ -136,15 +136,19 @@ Notes:
      - That BSSID is **never attacked again** (persistently, across runs).
    - If the ESSID could not be revealed, it is stored as `hidden_network` in the database and in file names.
 
-8. **Per‑run failure limits**
+9. **PMKID (hidden, no clients)**
+   - At **end of each cycle**, only when **cycle is a multiple of 5**, the script runs PMKID capture for hidden APs that have no clients (requires **hcxdumptool** and **hcxpcapngtool**).
+   - All such BSSIDs on the **same channel** are captured in **one run** per channel (time per channel set by `--pmkid-timeout`, default 15 s). Output is converted to `.22000` and stored; each captured BSSID is marked in the DB and not attacked again.
+
+10. **Per‑run failure limits**
    - For each BSSID, the script tracks the number of **failed attempts** in the current run (either no handshake or hcxpcapngtool failure).
    - After **4 failures** in the current execution, that BSSID is skipped for the rest of this run (but not added to the DB, so future runs can still try).
 
-9. **Looping**
+11. **Looping**
    - Once all candidates in a scan are processed, the tool logs completion of the cycle and starts a fresh scan.
    - This continues until you hit **Ctrl+C**.
 
-10. **Ctrl+C / SIGINT behaviour**
+12. **Ctrl+C / SIGINT behaviour**
    - Active `airodump-ng` processes are terminated.
    - The `finally` block:
      - Restores the interface to **managed** mode.
@@ -152,10 +156,9 @@ Notes:
      - Closes the SQLite connection and logs a clean exit.
      - Cleans the temporary directory used for scan CSVs.
 
-11. **Statistics**
-    - The script keeps counters for: cycles, candidate networks (with clients), capture attempts, successful captures, failures, skipped APs, and **hidden_detected** / **hidden_resolved** (hidden ESSID recovery).
-    - A statistics summary is always shown on exit.
-    - With `--stats` or `--stats SECONDS`, periodic statistics are shown during the run.
+13. **Statistics**
+    - Counters: **cycles**, **unique networks** (distinct BSSIDs seen), **attempts**, **success**, **failed**, **skipped**, **unique hidden** / **resolved**.
+    - Summary is shown on exit; with `--stats` or `--stats SECONDS`, periodic stats are printed during the run.
 
 ---
 
@@ -172,21 +175,12 @@ When `-w` is used, **no scans or attacks are performed**. Instead:
 
 For each ESSID:
 
-- Generate all **case permutations** (full 2ⁿ, n ≤ 12):  
-  e.g. `MyNetwork`, `mYnEtWoRk`, `MYNETWORK`, `mynetwork`, etc.
-- For each case variant, generate all **leet variants**:  
-  substitutions like `a→4`, `e→3`, `i→1`, `o→0`, `s→5`, `t→7`, `b→8`, `g→9`, `z→2`, `l→1`.  
-  Example: `MyNetwork` → `MyN3tw0rk`, `myn3twork`, `myN3tw0rk`, etc.
-- For every resulting base word:
-  - Append/prepend **suffixes**: `!`, `!!`, `@`, `#`, `123`, `1234`, `12345`, `123456`, `00`, `01`, `1`, `0`, `2`, `11`, `12`, `22`, `*`, `?`.
-  - Add **years**:
-    - Current year and previous 5: `YYYY` and `YY` (e.g. `2026`, `26`, `2025`, `25`, …).
-    - Also all years `1990–2030` in `YYYY` and `YY`.
-  - Add **months**: `01–12`.
-  - Combine with **separators** `.` `-` `_`, e.g.:  
-    `ESSID_1234`, `ESSID-2024`, `2024.ESSID`, `ESSID_26`, etc.
+- **Case variants**: lower, UPPER, Title (e.g. `mynetwork`, `MYNETWORK`, `Mynetwork`).
+- **Limited leet** (only `a→4`, `e→3`, `o→0`) for words up to 12 chars.
+- For each base word: **suffixes** (`!`, `!!`, `@`, `#`, `123`, `1234`, `*`, `?`), **years** (current and previous 5 in `YYYY` and `YY`), **months** (`01`–`12`), **separators** (`.`, `-`, `_`).
+- **ISP masks** (`.hcmask`) and hybrid bases are generated when ESSID matches known ISP patterns (e.g. MOVISTAR, VODAFONE, ORANGE).
 
-All candidates are **deduplicated** and sorted before being written.
+Candidates are deduplicated and sorted. Use `--max-words N` to cap entries per ESSID.
 
 Example:
 
@@ -207,7 +201,7 @@ Within the base path:
 - `captured.db` – SQLite database with:
   - Table `captured`: `bssid` (PRIMARY KEY), `essid`, `handshake_path`, `created_at`
   - Table `discovered_essids`: `bssid` (PRIMARY KEY), `essid`, `discovered_at` (cache of revealed hidden ESSIDs)
-- `handshakes/` – final handshake artifacts:
-  - `<ESSID>_<hash>_<BSSID>.cap`
-  - `<ESSID>_<hash>_<BSSID>.cap.22000` (if hcxpcapngtool is available)
-- Temporary scan CSVs are written into a dedicated temporary directory under `/tmp` on each run (not persistent).
+- `handshakes/` – handshake artifacts:
+  - `<ESSID>_<hash>_<BSSID>.cap` and `.cap.22000` (four-way handshake)
+  - `pmkid_ch<N>_<tag>.22000` (PMKID captures for hidden networks; one file can contain multiple BSSIDs)
+- Temporary scan CSVs are written to a temp directory under `/tmp` each run (removed on exit). Startup removes leftover `pmkid_filter_*.txt`, `pmkid_*.pcapng`, and `hs_*` from previous runs.

