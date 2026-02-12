@@ -541,10 +541,78 @@ def capture_handshake(
 # Leet substitutions (common)
 _LEET_MAP = {"a": "4", "e": "3", "i": "1", "o": "0", "s": "5", "t": "7", "b": "8", "g": "9", "z": "2", "l": "1"}
 
-# Max length to generate full 2^n case permutations (avoid explosion)
-_MAX_FULL_CASE_LEN = 12
-# Max leetable positions to generate full 2^k leet variants
+# Case permutations only if len <= 10; otherwise only lower/upper/title (avoid combinatorial explosion)
+_MAX_FULL_CASE_LEN = 10
+# Leet expansion only if len <= 12; otherwise no leet variants
+_MAX_LEET_LEN = 12
+# Max leetable positions to generate full 2^k leet variants (when len <= _MAX_LEET_LEN)
 _MAX_LEET_POSITIONS = 14
+
+# Hashcat masks per ISP profile (?h=hex, ?d=digit, ?a=alnum). Attack -a 3 with GPU.
+# ?h20 and ?a10 only included with --aggressive-masks (infeasible in normal audits).
+_ISP_MASKS = {
+    "MOVISTAR_OLD_HEX8": [{"mask": "?h" * 8, "priority": 1}],
+    "MOVISTAR_OLD_HEX20": [{"mask": "?h" * 20, "priority": 3}],   # only --aggressive-masks
+    "VODAFONE_NUM8": [{"mask": "?d" * 8, "priority": 1}],
+    "ORANGE_ALNUM10": [{"mask": "?a" * 10, "priority": 2}],        # only --aggressive-masks
+    "GENERIC_NUM9": [{"mask": "?d" * 9, "priority": 1}],
+    "GENERIC_ALNUM8": [{"mask": "?a" * 8, "priority": 1}],
+}
+
+
+def generate_isp_masks(essid: str, aggressive: bool = False) -> tuple[Optional[str], list[dict]]:
+    """
+    Returns (ISP_profile, list of {mask, priority}) based on ESSID.
+    By default does not include infeasible masks (?h20, ?a10); use aggressive=True or --aggressive-masks.
+    """
+    essid_upper = essid.upper().strip()
+    if not essid_upper:
+        return None, []
+
+    if essid_upper.startswith("MOVISTAR"):
+        out: list[dict] = [{"mask": "?h" * 8, "priority": 1}]
+        # Derive mask from ESSID hex suffix (e.g. MOVISTAR_1A2B -> 1A2B + ?h^4)
+        m = re.search(r"_([0-9A-F]{4})$", essid_upper)
+        if m:
+            suffix = m.group(1)
+            out.append({"mask": suffix + "?h" * 4, "priority": 1})
+            out.append({"mask": "?h" * 4 + suffix, "priority": 1})
+        if aggressive:
+            out.append({"mask": "?h" * 20, "priority": 3})
+        return "MOVISTAR", out
+
+    if essid_upper.startswith("VODAFONE"):
+        return "VODAFONE", [
+            {"mask": "?d" * 8, "priority": 1},
+        ]
+    if essid_upper.startswith("ORANGE"):
+        if aggressive:
+            return "ORANGE", [{"mask": "?a" * 10, "priority": 2}]
+        return "ORANGE", []  # ?a10 infeasible by default
+
+    return None, []
+
+
+def _mask_keyspace(mask: str) -> int:
+    """Search space size for a hashcat mask (?h=16, ?d=10, ?a=95)."""
+    n_h, n_d, n_a = mask.count("?h"), mask.count("?d"), mask.count("?a")
+    return (16 ** n_h) * (10 ** n_d) * (95 ** n_a)
+
+
+def _estimate_mask_time_hours(keyspace: int, speed_hps: float = 300_000.0) -> float:
+    """Estimate hours to exhaust keyspace at speed_hps (WPA2 ~250-350 kH/s typical)."""
+    if keyspace <= 0 or speed_hps <= 0:
+        return 0.0
+    return keyspace / speed_hps / 3600.0
+
+
+def write_hcmask(filename: str, masks: list[dict]) -> None:
+    """Write a .hcmask file for hashcat -a 3 (mask attack). Sorts by priority."""
+    Path(filename).parent.mkdir(parents=True, exist_ok=True)
+    sorted_masks = sorted(masks, key=lambda x: x["priority"])
+    with open(filename, "w", encoding="utf-8") as f:
+        for entry in sorted_masks:
+            f.write(entry["mask"] + "\n")
 
 
 def _all_case_permutations(word: str) -> set[str]:
@@ -561,8 +629,10 @@ def _all_case_permutations(word: str) -> set[str]:
 
 
 def _all_leet_variants(word: str) -> set[str]:
-    """All 2^k leet variants (substitute or not for each leetable char). Preserves case of non-substituted."""
+    """All 2^k leet variants (substitute or not for each leetable char). Only if len <= 12."""
     low = word.lower()
+    if len(low) > _MAX_LEET_LEN:
+        return {word}
     # Positions that have a leet substitution
     positions = [i for i in range(len(low)) if low[i] in _LEET_MAP]
     if len(positions) > _MAX_LEET_POSITIONS:
@@ -586,61 +656,85 @@ def _case_then_leet_bases(word: str) -> set[str]:
     return bases
 
 
-def generate_wordlist_for_essid(essid: str, output_path: Path) -> int:
+def generate_wordlist_for_essid(essid: str, output_path: Path, max_words: Optional[int] = None) -> int:
     """
     Generate a wordlist for the given ESSID: case/leet permutations + prefixes/suffixes (years, months, etc.).
-    Returns number of lines written. No attacks; file-only.
+    Incremental generation: if max_words is set, stop adding once that limit is reached (less RAM and time).
     """
     if not essid or not essid.strip():
         return 0
     base = essid.strip()
-    # All case x leet combinations (e.g. Sarabi -> S4rabi, saR4b1, s4r4b1, ...)
     bases = _case_then_leet_bases(base)
-    words: set[str] = set(bases)
+    words: set[str] = set()
+    # Only WPA2-valid candidates (8-63 chars)
+    for w in bases:
+        if 8 <= len(w) <= 63:
+            words.add(w)
     current_year = time.localtime().tm_year
     year_suffixes = []
-    for i in range(6):  # current year + 5 back
+    for i in range(6):
         y = current_year - i
         year_suffixes.append(str(y))
         year_suffixes.append(str(y)[2:])
-    years_full = [str(y) for y in range(1990, 2031)]
-    years_short = [str(y)[2:] for y in range(1990, 2031)]
+    # Limit years to avoid explosion: 2000–current for full, last 15 years for short
+    years_full = [str(y) for y in range(2000, current_year + 1)]
+    years_short = [str(y)[2:] for y in range(max(2000, current_year - 14), current_year + 1)]
     months = [f"{m:02d}" for m in range(1, 13)]
     suffixes = ["!", "!!", "@", "#", "123", "1234", "*", "?"]
     separators = [".", "-", "_", "*"]
-    for w in bases:
-        for suf in suffixes:
-            words.add(w + suf)
-            words.add(suf + w)
+
+    def capped() -> bool:
+        return max_words is not None and len(words) >= max_words
+
+    def add(s: str) -> None:
+        if 8 <= len(s) <= 63:
+            words.add(s)
+
+    # Incremental generation: stop as soon as we reach max_words
+    if not capped():
+        for w in bases:
+            if capped():
+                break
+            for suf in suffixes:
+                add(w + suf)
+                add(suf + w)
+                for sep in separators:
+                    add(w + sep + suf)
+                    add(suf + sep + w)
+            if capped():
+                break
+            for y in year_suffixes:
+                add(w + y)
+                add(y + w)
+                for sep in separators:
+                    add(w + sep + y)
+                    add(y + sep + w)
+            if capped():
+                break
+            for y in years_full:
+                add(w + y)
+                add(y + w)
+            for y in years_short:
+                add(w + y)
+                add(y + w)
+            if capped():
+                break
+            for m in months:
+                add(m + w)
+                add(w + m)
+                for sep in separators:
+                    add(w + sep + m)
+                    add(m + sep + w)
+            add(w + "!")
+            add(w + "123")
+            add(w + "@")
             for sep in separators:
-                words.add(w + sep + suf)
-                words.add(suf + sep + w)
-        for y in year_suffixes:
-            words.add(w + y)
-            words.add(y + w)
-            for sep in separators:
-                words.add(w + sep + y)
-                words.add(y + sep + w)
-        for y in years_full:
-            words.add(w + y)
-            words.add(y + w)
-        for y in years_short:
-            words.add(w + y)
-            words.add(y + w)
-        for m in months:
-            words.add(w + m)
-            words.add(m + w)
-            for sep in separators:
-                words.add(w + sep + m)
-                words.add(m + sep + w)
-        words.add(w + "!")
-        words.add(w + "123")
-        words.add(w + "@")
-        for sep in separators:
-            words.add(w + sep + "123")
-            words.add(w + sep + "!")
-    # Dedupe and sort
+                add(w + sep + "123")
+                add(w + sep + "!")
+
     lines = sorted(words)
+    if max_words is not None and len(lines) > max_words:
+        lines = lines[:max_words]
     output_path.parent.mkdir(parents=True, exist_ok=True)
     with open(output_path, "w", encoding="utf-8", errors="replace") as f:
         for line in lines:
@@ -797,6 +891,10 @@ def main() -> int:
                         help="Show verbose messages (e.g. why a handshake was not marked as captured)")
     parser.add_argument("-w", "--wordlist", nargs="?", const="", default=None, metavar="DIR",
                         help="Generate wordlists for captured ESSIDs only (no attacks); DIR = output dir (default: <path>/wordlists)")
+    parser.add_argument("--max-words", type=int, default=None, metavar="N",
+                        help="Cap wordlist at N entries per ESSID (e.g. 500000).")
+    parser.add_argument("--aggressive-masks", action="store_true",
+                        help="Include heavy masks (?h20, ?a10) in ISP .hcmask (infeasible in normal audits).")
     parser.add_argument("-b", "--bssid", action="append", default=[], dest="target_bssids", metavar="BSSID",
                         help="Single target mode by BSSID (repeatable). If used, only these BSSIDs will be attacked.")
     parser.add_argument("-e", "--essid", action="append", default=[], dest="target_essids", metavar="ESSID",
@@ -835,9 +933,40 @@ def main() -> int:
             seen.add(essid)
             safe_name = re.sub(r"[^\w\-.]", "_", essid)[:50]
             out_file = out_dir / f"{safe_name}.txt"
-            n = generate_wordlist_for_essid(essid, out_file)
+            n = generate_wordlist_for_essid(essid, out_file, max_words=args.max_words)
             total_words += n
             logging.info("Generated wordlist for %s: %s (%d words)", essid, out_file, n)
+            # Recommended hashcat command: wordlist attack (-a 0)
+            handshake_placeholder = "HANDSHAKE.22000"
+            try:
+                row_h = conn.execute("SELECT handshake_path FROM captured WHERE essid = ? LIMIT 1", (essid,)).fetchone()
+                if row_h and row_h[0]:
+                    handshake_placeholder = str(Path(row_h[0]).resolve())
+            except Exception:
+                pass
+            logging.info(
+                "  Hashcat (wordlist): hashcat -m 22000 %s -a 0 %s -O -w 4 --status",
+                handshake_placeholder, out_file.resolve(),
+            )
+            isp, masks = generate_isp_masks(essid, aggressive=args.aggressive_masks)
+            if masks:
+                hcmask_path = out_dir / f"{safe_name}_isp.hcmask"
+                write_hcmask(str(hcmask_path), masks)
+                logging.info("Generated ISP masks for %s: %s (%s, %d masks)", essid, hcmask_path, isp or "", len(masks))
+                # Estimator: if any mask > 48h at ~300 kH/s, warn
+                for entry in masks:
+                    ks = _mask_keyspace(entry["mask"])
+                    hours = _estimate_mask_time_hours(ks)
+                    if hours > 48:
+                        logging.warning(
+                            "  Mask %s: keyspace ~%.2e, estimated > %.0f h at 300 kH/s -> infeasible without --runtime or specific context.",
+                            entry["mask"], float(ks), hours,
+                        )
+                logging.info(
+                    "  Hashcat (mask ISP): hashcat -m 22000 %s -a 3 %s -O -w 4 --status",
+                    handshake_placeholder, hcmask_path.resolve(),
+                )
+                logging.info("  For heavy masks: add --runtime=1800 to avoid running indefinitely.")
         conn.close()
         if not seen:
             logging.warning("No captured ESSIDs in DB; no wordlists generated.")
