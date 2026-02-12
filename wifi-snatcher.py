@@ -45,11 +45,19 @@ try:
     colorama_init(autoreset=True)
     HAS_COLORAMA = True
 except ImportError:
-    HAS_COLORAMA = False
-    _d = ""
-    Fore = type("F", (), {"GREEN": _d, "RED": _d, "YELLOW": _d, "CYAN": _d, "MAGENTA": _d, "BLUE": _d, "WHITE": _d, "RESET": _d})()
-    Style = type("S", (), {"BRIGHT": _d, "DIM": _d, "RESET_ALL": _d})()
-    Back = type("B", (), {"BLACK": _d, "RESET": _d})()
+    # Fallback: raw ANSI when stdout is a TTY (e.g. user Python without colorama, sudo has it)
+    if hasattr(sys, "stdout") and sys.stdout is not None and getattr(sys.stdout, "isatty", lambda: False)():
+        _e = "\033["
+        Fore = type("F", (), {"GREEN": _e + "32m", "RED": _e + "31m", "YELLOW": _e + "33m", "CYAN": _e + "36m", "MAGENTA": _e + "35m", "BLUE": _e + "34m", "WHITE": _e + "37m", "RESET": ""})()
+        Style = type("S", (), {"BRIGHT": _e + "1m", "DIM": _e + "2m", "RESET_ALL": _e + "0m"})()
+        Back = type("B", (), {"BLACK": _e + "40m", "RESET": ""})()
+        HAS_COLORAMA = True
+    else:
+        HAS_COLORAMA = False
+        _d = ""
+        Fore = type("F", (), {"GREEN": _d, "RED": _d, "YELLOW": _d, "CYAN": _d, "MAGENTA": _d, "BLUE": _d, "WHITE": _d, "RESET": _d})()
+        Style = type("S", (), {"BRIGHT": _d, "DIM": _d, "RESET_ALL": _d})()
+        Back = type("B", (), {"BLACK": _d, "RESET": _d})()
 
 R = Style.RESET_ALL if HAS_COLORAMA else ""
 
@@ -629,6 +637,7 @@ def try_capture_pmkid(
     except OSError:
         pass
     if code == 0 and out_22000.exists() and out_22000.stat().st_size > 0:
+        _deduplicate_22000_file(out_22000)
         return out_22000
     if out_22000.exists():
         try:
@@ -718,6 +727,7 @@ def try_capture_pmkid_channel(
             except OSError:
                 pass
         return []
+    _deduplicate_22000_file(out_22000)
     # Parse .22000: WPA*01*PMKID*MAC_AP*MAC_CLIENT*ESSID -> extract MAC_AP (normalize to lowercase)
     bssid_lower_set: set[str] = set()
     try:
@@ -751,10 +761,32 @@ def verify_handshake_cap(cap_path: Path) -> bool:
     return "handshake" in combined and "0 handshake" not in combined
 
 
+def _deduplicate_22000_file(path: Path) -> None:
+    """Remove duplicate hash lines in a .22000 file so hashcat does not waste time on duplicates."""
+    if not path.exists() or path.stat().st_size == 0:
+        return
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            lines = [line for line in f if line.strip()]
+        seen: set[str] = set()
+        unique: list[str] = []
+        for line in lines:
+            key = line.strip()
+            if key and key not in seen:
+                seen.add(key)
+                unique.append(line if line.endswith("\n") else line + "\n")
+        if len(unique) >= len(lines):
+            return
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.writelines(unique)
+    except OSError:
+        pass
+
+
 def convert_cap_to_hashcat(cap_path: Path) -> Optional[Path]:
     """
     Convert .cap to hashcat WPA-PBKDF2 (22000) format using hcxpcapngtool if available.
-    Returns path to .22000 file or None. Removes partial .22000 if conversion fails.
+    Returns path to .22000 file or None. Deduplicates hash lines to avoid redundant crack time.
     """
     out_path = cap_path.with_suffix(cap_path.suffix + ".22000")
     code, out, err = run_cmd(
@@ -762,6 +794,7 @@ def convert_cap_to_hashcat(cap_path: Path) -> Optional[Path]:
         timeout=60,
     )
     if code == 0 and out_path.exists() and out_path.stat().st_size > 0:
+        _deduplicate_22000_file(out_path)
         return out_path
     if out_path.exists():
         try:
@@ -1448,17 +1481,24 @@ def main() -> int:
             n = generate_wordlist_for_essid(essid, out_file, max_words=args.max_words)
             total_words += n
             logging.info("Generated wordlist for %s: %s (%d words)", essid, out_file, n)
-            # Recommended hashcat command: wordlist attack (-a 0)
+            # Recommended hashcat command: wordlist attack (-a 0); use .22000 file for hashcat
+            def _rel(base: Path, p: Path) -> str:
+                try:
+                    return str(Path(p).resolve().relative_to(base.resolve()))
+                except ValueError:
+                    return str(Path(p).resolve())
             handshake_placeholder = "HANDSHAKE.22000"
             try:
                 row_h = conn.execute("SELECT handshake_path FROM captured WHERE essid = ? LIMIT 1", (essid,)).fetchone()
                 if row_h and row_h[0]:
-                    handshake_placeholder = str(Path(row_h[0]).resolve())
+                    p = Path(row_h[0]).resolve()
+                    hc_path = p.with_suffix(p.suffix + ".22000")
+                    handshake_placeholder = _rel(base_path, hc_path) if hc_path.exists() else _rel(base_path, p)
             except Exception:
                 pass
             logging.info(
-                "  Hashcat (wordlist): hashcat -m 22000 %s -a 0 %s -O -w 4 --status",
-                handshake_placeholder, out_file.resolve(),
+                "  Hashcat (wordlist): hashcat -a 0 -m 22000 %s %s -O -w 4 --status --force",
+                handshake_placeholder, _rel(base_path, out_file),
             )
             isp, masks, hybrid_bases = generate_isp_masks(essid, aggressive=args.aggressive_masks, bssid=bssid)
             if masks:
@@ -1470,18 +1510,18 @@ def main() -> int:
                     f", {skipped} skipped (>48h)" if skipped else "",
                 )
                 logging.info(
-                    "  Hashcat (mask -a 3): hashcat -m 22000 %s -a 3 %s -O -w 4 --status",
-                    handshake_placeholder, hcmask_path.resolve(),
+                    "  Hashcat (mask -a 3): hashcat -a 3 -m 22000 %s %s -O -w 4 --status --force",
+                    handshake_placeholder, _rel(base_path, hcmask_path),
                 )
                 if hybrid_bases:
                     bases_path = out_dir / f"{safe_name}_isp_bases.txt"
                     bases_path.write_text("\n".join(hybrid_bases) + "\n", encoding="utf-8")
-                    logging.info("  Hybrid bases for -a 6: %s (%d words)", bases_path.resolve(), len(hybrid_bases))
+                    logging.info("  Hybrid bases for -a 6: %s (%d words)", _rel(base_path, bases_path), len(hybrid_bases))
                     example_mask = next((m["mask"] for m in sorted(masks, key=lambda x: x["priority"]) if _estimate_mask_time_hours(_mask_keyspace(m["mask"]), speed_hps) <= 48), None)
                     if example_mask:
                         logging.info(
-                            '  Hashcat (hybrid -a 6): hashcat -m 22000 %s -a 6 %s "%s" -O -w 4 --status',
-                            handshake_placeholder, bases_path.resolve(), example_mask,
+                            '  Hashcat (hybrid -a 6): hashcat -a 6 -m 22000 %s %s "%s" -O -w 4 --status --force',
+                            handshake_placeholder, _rel(base_path, bases_path), example_mask,
                         )
                 logging.info("  For long runs: add --runtime=1800 to avoid running indefinitely.")
         conn.close()
