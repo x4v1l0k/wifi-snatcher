@@ -215,12 +215,33 @@ def rotate_mac(iface: str) -> bool:
     return False
 
 
+def _is_hwsim_interface(mon_iface: str) -> bool:
+    """Return True if the interface is backed by mac80211_hwsim (virtual radios)."""
+    try:
+        driver_link = Path(f"/sys/class/net/{mon_iface}/device/driver")
+        if driver_link.exists():
+            name = driver_link.resolve().name
+            if "hwsim" in name.lower():
+                return True
+        # phy might be linked to hwsim
+        phy_path = Path(f"/sys/class/net/{mon_iface}/phy80211/name")
+        if phy_path.exists():
+            # Not enough to know driver; driver check above is the main one
+            pass
+    except (OSError, RuntimeError):
+        pass
+    return False
+
+
 def _check_injection(mon_iface: str) -> bool:
     """Run aireplay-ng --test to verify driver supports packet injection. Returns True if injection works."""
     code, out, err = run_cmd(["aireplay-ng", "--test", mon_iface], timeout=15)
     combined = (out or "") + " " + (err or "")
     if code == 0 and ("Injection is working" in combined or "Reply" in combined):
         logging.info("Injection test passed for %s", mon_iface)
+        return True
+    if _is_hwsim_interface(mon_iface):
+        logging.info("Injection test inconclusive for %s (mac80211_hwsim detected; assuming injection supported)", mon_iface)
         return True
     logging.warning("Injection test failed or inconclusive for %s (driver may not support injection)", mon_iface)
     return False
@@ -348,6 +369,12 @@ def parse_airodump_csv(csv_path: Path) -> tuple[list[dict], list[dict]]:
                         if not essid_val:
                             essid_val = "hidden_network"
                         ap["ESSID"] = essid_val
+                        auth = (ap.get("Authentication") or ap.get(" Authentication") or "").strip().upper()
+                        privacy = (ap.get("Privacy") or ap.get(" Privacy") or "").strip().upper()
+                        is_mgt = "MGT" in auth or "802.1X" in auth or "ENTERPRISE" in auth
+                        is_wpa3_or_sae = "WPA3" in privacy or "SAE" in auth
+                        has_wpa = "WPA" in privacy or "WPA2" in privacy
+                        ap["is_crackable"] = (not is_mgt) and (not is_wpa3_or_sae) and has_wpa
                         aps.append(ap)
             elif section == "station" and headers_st:
                 if first and re.match(r"([0-9A-Fa-f]{2}:){5}[0-9A-Fa-f]{2}", first):
@@ -369,9 +396,8 @@ def get_networks_with_clients(
     channel: Optional[int] = None,
 ) -> list[dict]:
     """
-    Run airodump for scan_secs, parse CSV, return list of APs that have at least
-    one client, excluding skip_bssids and skip_essids. Each item: {bssid, channel, essid, clients: [mac, ...]}.
-    Scan CSVs are written to scan_dir (temporary directory).
+    Run airodump for scan_secs (--encrypt WPA --encrypt WPA2), parse CSV, return list of APs
+    that have at least one client and are crackable (WPA/WPA2-PSK only). MGT, WPA3/SAE, WEP, OPN excluded.
     """
     skip_essids = skip_essids or set()
     scan_dir.mkdir(parents=True, exist_ok=True)
@@ -389,6 +415,8 @@ def get_networks_with_clients(
     else:
         # 2.4GHz (b/g) + 5GHz (a)
         cmd.extend(["--band", "abg"])
+    # Only WPA/WPA2 (handshake crackable); skip WEP/OPN
+    cmd.extend(["--encrypt", "WPA", "--encrypt", "WPA2"])
     cmd.extend(
         [
             "-a",  # only associated
@@ -440,6 +468,8 @@ def get_networks_with_clients(
         if not bssid_raw or bssid_lower in skip_bssids:
             continue
         if essid in skip_essids:
+            continue
+        if not ap.get("is_crackable", False):
             continue
         clients = bssid_to_clients.get(bssid_lower, [])
         # Include only: APs with clients (handshake this cycle), or hidden with no clients (PMKID at end)
@@ -1412,7 +1442,8 @@ def main() -> int:
         formatter_class=_HelpFormatter,
     )
     parser.add_argument("-d", "--device", default=None, help="Wireless interface (e.g. wlan0); not required with -w")
-    parser.add_argument("-t", "--time", type=int, default=60, help="Scan duration in seconds")
+    parser.add_argument("-t", "--time", "--scan-time", type=int, default=60, metavar="SECONDS",
+                        help="Scan duration in seconds per round (default: 60)")
     parser.add_argument("-l", "--log", default=None, help="Path to log file")
     parser.add_argument("-p", "--path", default=None, help="Directory for scan files, handshakes and DB")
     parser.add_argument("-se", "--skip-essid", action="append", default=[], dest="skip_essids", metavar="ESSID",
